@@ -21,8 +21,14 @@ from dataclasses import asdict, dataclass
 import textforge as tf
 
 from . import catalog as C
+from . import lexicon, phrasing
 from .engine import canonical_text, run_builder
 from .texts import VOCAB, make_text
+
+#: share of prompts written with the original templates (the rest use phrasing.py)
+CLASSIC_SHARE = 0.25
+#: share of literal values taken from the original small pools (the rest: lexicon.py)
+CLASSIC_VALUES = 0.4
 
 #: Instructions that reshape the text so much that line/word steps after them are
 #: odd or meaningless. They are only placed as the last step.
@@ -32,6 +38,7 @@ TERMINAL = frozenset(
 
 _TEXT_LITERALS = ("!", ".", " END", "--", ">> ", "[x] ", "NOTE: ", " (done)", "***", "# ")
 _SEPARATORS = (", ", " | ", " ", "; ", " / ", " - ")
+_MORE_SEPARATORS = (",", "|", " -> ", " + ", " :: ", " & ", "; ", " ", ", ")
 _PAD_CHARS = ("*", "-", "=", ".", "#")
 _CONTENT_WORDS = tuple(w for w in VOCAB if len(w) > 3)
 
@@ -55,16 +62,19 @@ class Example:
 
 
 def sample_value(kind: str, rng: random.Random) -> int | str:
+    classic = rng.random() < CLASSIC_VALUES
     if kind == C.WORD:
-        return rng.choice(_CONTENT_WORDS)
+        return rng.choice(_CONTENT_WORDS) if classic else lexicon.pattern(rng)
     if kind == C.REPL:
+        if not classic:
+            return lexicon.replacement(rng)
         return rng.choice(_CONTENT_WORDS).upper() if rng.random() < 0.3 else rng.choice(
             _CONTENT_WORDS
         )
     if kind == C.TEXT:
-        return rng.choice(_TEXT_LITERALS)
+        return rng.choice(_TEXT_LITERALS) if classic else lexicon.literal(rng)
     if kind == C.SEP:
-        return rng.choice(_SEPARATORS)
+        return rng.choice(_SEPARATORS if classic else _MORE_SEPARATORS)
     if kind == C.PAD_CHAR:
         return rng.choice(_PAD_CHARS)
     if kind == C.CHAR_IDX:
@@ -117,6 +127,13 @@ def _cap(text: str) -> str:
 
 
 def describe(steps: list[Step], rng: random.Random) -> str:
+    if rng.random() >= CLASSIC_SHARE:
+        return phrasing.describe(steps, rng)
+    return describe_classic(steps, rng)
+
+
+def describe_classic(steps: list[Step], rng: random.Random) -> str:
+    """The original phrasing: catalog templates, double quotes, 4 ways to chain steps."""
     clauses = [describe_step(s, rng) for s in steps]
     if len(clauses) == 1:
         frame = rng.choice(("{}.", "please {}.", "{}", "I need you to {}."))

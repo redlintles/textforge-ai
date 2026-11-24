@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# Atalho para usar o modelo sem ativar a .venv:
+#   ./tfai texto.txt "Uppercase the text."      um pedido
+#   ./tfai texto.txt                            modo interativo (prompt>)
+#   ./tfai --help                               todas as opções
+# Para usar de qualquer pasta: ln -s "$PWD/tfai" ~/.local/bin/tfai
+DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then set -- --help; fi
+exec "$DIR/.venv/bin/python" -m textforge_ai ask "$@"

@@ -47,3 +47,37 @@
   testes acharam um segundo problema (`token_type_ids`), também corrigido.
 - Limitação: daqui não dá para baixar o tokenizador real; a correção foi validada pela
   suíte com o modelo minúsculo, não com o CodeT5.
+
+## 2026-11-23 — Treino de teste e retomada
+
+- Treino de teste no PC do usuário: geração 56% (válidos 92%), verificador 56% (~acaso).
+- Tempo real: 3,7 s/passo, ~3,7× pior que a estimativa. Treino completo de 3 épocas ≈ 14 h.
+- Retomada reescrita: checkpoint completo a cada 200 passos (pesos + otimizador + scheduler +
+  RNG + posição), gravação atômica, SIGINT/SIGTERM salvam antes de sair, `--resume`.
+  Embaralhamento agora é por época a partir de uma cópia (antes era cumulativo e impedia
+  retomada exata). Teste compara pesos de "parar e retomar" vs "sem parar": idênticos.
+- Script: modos `continuar` e `parar`; `completo` aceita argumentos extras.
+- `.gitignore`: `runs/` e `*.log`.
+- Incidente no ambiente de desenvolvimento: um processo órfão de teste deixou a suíte em
+  9 min; encerrado, voltou a ~19 s. 139 testes passando.
+
+## 2026-11-24 — Treino completo e comando simples
+
+- Treino completo (2 épocas, ~7,8 h): geração 100% nos probes, verificador 93%. Detalhes em
+  docs/04.
+- Primeiro uso falhou: entrada vazia (`cat "frase" >> input.txt`) e pedido em português.
+- Novo comando `ask` + atalho `./tfai texto.txt "pedido"`: pedido posicional, modelo padrão
+  `runs/codet5-small/best`, modo interativo que carrega o modelo uma vez, aviso de entrada
+  vazia e explicação quando o modelo não gera nenhum pipeline válido. `--model` virou
+  opcional em `solve`/`verify`/`model-eval`. 3 testes novos.
+
+## 2026-11-24 (tarde) — O modelo só sabia os templates
+
+- Pedidos livres falhavam. Novo teste com 80 pedidos escritos à mão (`ood.py`, `ood-eval`):
+  **55%** (validação: 100%). Compor passos 28%, literais novos 22%.
+- Causas: 2–3 frases fixas por instrução, e só 10 literais fixos para `ate`/`atb` (o modelo
+  decorou strings em vez de copiar: `laranja` → `laranaja`, `mango` → `morango`).
+- Gerador novo (`phrasing.py`, `lexicon.py`): muito mais frases, aspas, índices, conectores,
+  ruído e valores. Re-treino a partir do modelo atual: `bash scripts/treinar.sh variado`.
+  Detalhes em docs/05. 186 testes passando (sem os de modelo, que precisam de torch).
+

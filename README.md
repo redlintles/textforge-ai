@@ -23,7 +23,20 @@ pip install torch --index-url https://download.pytorch.org/whl/cpu   # só para 
 pip install -e ".[dev,train]"
 ```
 
-## Uso
+## Usar o modelo treinado
+
+```bash
+./tfai texto.txt "Uppercase the text."            # um pedido (não precisa ativar a .venv)
+./tfai texto.txt                                  # modo interativo: carrega o modelo uma vez
+./tfai texto.txt "Remove all whitespace." -o saida.txt -p saida.tft   # salva texto e pipeline
+./tfai --help
+```
+
+`texto.txt` é o texto a transformar; o pedido vai **separado**, em inglês, no estilo do
+dataset (valores literais entre aspas duplas). O modelo padrão é `runs/codet5-small/best`
+(mude com `--model` ou `TFAI_MODEL`).
+
+## Outros comandos
 
 ```bash
 python -m textforge_ai gen-data --n 20000 --out data          # dataset sintético
@@ -31,8 +44,10 @@ python -m textforge_ai baseline oracle --data data/test.jsonl  # sanidade das m�
 python -m textforge_ai eval --data data/test.jsonl --pred preds.jsonl
 python -m textforge_ai run pipeline.tft entrada.txt            # aplica um pipeline
 python -m textforge_ai train --data data --out runs/codet5-small  # treina (ver docs/04)
-python -m textforge_ai solve --model runs/codet5-small/best --input texto.txt
-python -m textforge_ai verify --model runs/codet5-small/best --input texto.txt --pipeline p.tft
+python -m textforge_ai ood-eval                                # 80 pedidos escritos à mão (docs/05)
+bash scripts/treinar.sh variado                                # re-treino com dataset variado (docs/05)
+python -m textforge_ai solve --input texto.txt                 # versão longa do ./tfai
+python -m textforge_ai verify --input texto.txt --pipeline p.tft
 pytest                                                          # testes
 ```
 
@@ -44,6 +59,9 @@ src/textforge_ai/
   catalog.py    instruções permitidas + templates em inglês
   texts.py      gerador de textos de entrada ("probes")
   synth.py      gera e verifica exemplos (pedido → pipeline)
+  phrasing.py   variação das frases dos pedidos (fase 6)
+  lexicon.py    valores literais variados (fase 6)
+  ood.py        80 pedidos escritos à mão: teste de generalização
   dataset.py    geração em lote, divisão por pipeline, JSONL
   guards.py     detectores de "trapaça" (apagar o texto e escrever a resposta)
   evaluate.py   métricas

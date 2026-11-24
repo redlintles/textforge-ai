@@ -8,6 +8,8 @@ eval       score a predictions JSONL file ({"id": ..., "pipeline": ...} per line
 run        apply a .tft pipeline to a text file (or stdin)
 train      fine-tune the model (generate + verify)            [needs .[train]]
 model-eval score a trained model on a split                   [needs .[train]]
+ood-eval   score a trained model on hand-written requests (ood.py) [needs .[train]]
+ask        simplest way to use the model: ask TEXT ["request"]  [needs .[train]]
 solve      prompt + text -> best pipeline, output and verdict  [needs .[train]]
 verify     does a given .tft pipeline do what the prompt asks? [needs .[train]]
 """
@@ -16,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -23,6 +26,25 @@ from . import dataset
 from .baselines import BASELINES
 from .engine import run_pipeline_text
 from .evaluate import evaluate, evaluate_predictor
+
+# Where `bash scripts/treinar.sh` saves the best model: the phase-6 model (variado)
+# when it exists, otherwise the first one.
+_RUNS = Path(__file__).resolve().parents[2] / "runs"
+DEFAULT_MODEL_DIR = _RUNS / "codet5-small" / "best"
+V2_MODEL_DIR = _RUNS / "codet5-v2" / "best"
+
+NO_CANDIDATE_HINT = """the model did not produce any valid pipeline for this request.
+The model was trained only on English requests in the dataset's style. Examples:
+  Uppercase the text.
+  Remove all whitespace. Append "banana" to the text. Prepend "orange" to the text.
+  Replace every "apple" with "pear", then delete the empty lines.
+Put literal values in double quotes."""
+
+
+def _default_model() -> str:
+    if os.environ.get("TFAI_MODEL"):
+        return os.environ["TFAI_MODEL"]
+    return str(V2_MODEL_DIR if V2_MODEL_DIR.is_dir() else DEFAULT_MODEL_DIR)
 
 
 def _gen_data(args: argparse.Namespace) -> int:
@@ -82,7 +104,10 @@ def _train(args: argparse.Namespace) -> int:
     fields = TrainConfig.__dataclass_fields__
     cfg = TrainConfig(**{k: v for k, v in vars(args).items() if k in fields and v is not None})
     result = train(cfg)
-    print(json.dumps({"best_gen_probe_accuracy": result["best_gen_probe_accuracy"]}))
+    if result["stopped"]:
+        print(json.dumps({"stopped_at_step": result["step"], "resume": "add --resume"}))
+    else:
+        print(json.dumps({"best_gen_probe_accuracy": result["best_gen_probe_accuracy"]}))
     return 0
 
 
@@ -93,6 +118,23 @@ def _model_eval(args: argparse.Namespace) -> int:
     forge = Forge.from_dir(args.model, args.device)
     examples = list(dataset.read_jsonl(args.data))[: args.limit]
     print(json.dumps(evaluate_model(forge, examples), indent=2))
+    return 0
+
+
+def _ood_eval(args: argparse.Namespace) -> int:
+    from . import ood
+    from .infer import Forge
+
+    forge = Forge.from_dir(args.model, args.device)
+    rows = ood.build_examples()
+    predictions = []
+    for i in range(0, len(rows), 16):
+        predictions += forge.generate_batch([r["prompt"] for r in rows[i : i + 16]])
+    result = ood.report(rows, predictions)
+    print(ood.format_report(result, args.show))
+    if args.details:
+        Path(args.details).write_text(json.dumps(result, indent=2, ensure_ascii=False),
+                                      encoding="utf-8")
     return 0
 
 
@@ -115,6 +157,9 @@ def _solve(args: argparse.Namespace) -> int:
         print(json.dumps({"pipeline": c.pipeline, "ok": c.ok, "error": c.error,
                           "verdict": _verdict_dict(c.verdict), "suspicious": c.suspicious}),
               file=sys.stderr)
+    if not result.candidates:
+        print(NO_CANDIDATE_HINT, file=sys.stderr)
+        return 2
     if result.best is None:
         print("no candidate passed validation", file=sys.stderr)
         return 2
@@ -126,6 +171,62 @@ def _solve(args: argparse.Namespace) -> int:
     print("## verdict\n" + json.dumps(_verdict_dict(result.best.verdict)))
     print("## output\n" + result.best.output)
     return 0
+
+
+def _ask(args: argparse.Namespace) -> int:
+    from .infer import Forge
+
+    text = sys.stdin.read() if args.input == "-" else Path(args.input).read_text(encoding="utf-8")
+    if not text.strip():
+        print(f"warning: {args.input} is empty; there is no text to transform", file=sys.stderr)
+    expected = Path(args.expected).read_text(encoding="utf-8") if args.expected else None
+    forge = Forge.from_dir(args.model, args.device)
+
+    def answer(prompt: str) -> int:
+        result = forge.solve(prompt, text, expected, n=args.candidates)
+        if args.verbose:
+            for c in result.candidates:
+                print(json.dumps({"pipeline": c.pipeline, "ok": c.ok, "error": c.error,
+                                  "verdict": _verdict_dict(c.verdict),
+                                  "suspicious": c.suspicious}), file=sys.stderr)
+        if not result.candidates:
+            print(NO_CANDIDATE_HINT, file=sys.stderr)
+            return 2
+        best = result.best
+        if best is None:
+            print("no candidate passed validation (add -v to see them)", file=sys.stderr)
+            return 2
+        v = best.verdict
+        kind = "exact" if v.method == "expected-output" else "model estimate"
+        print("## pipeline\n" + best.pipeline)
+        print(f"## verdict\n{v.detail} ({v.confidence:.0%}, {kind})")
+        print("## output\n" + best.output)
+        if args.save_pipeline:
+            Path(args.save_pipeline).write_text(best.pipeline + "\n", encoding="utf-8")
+        if args.output:
+            Path(args.output).write_text(best.output, encoding="utf-8")
+        return 0
+
+    if args.prompt_file:
+        return answer(Path(args.prompt_file).read_text(encoding="utf-8").strip())
+    if args.prompt:
+        return answer(args.prompt)
+    if args.input == "-":
+        print("error: with text on stdin, pass the request as an argument", file=sys.stderr)
+        return 1
+    print("model loaded. Type a request in English (empty line or Ctrl+D to quit).",
+          file=sys.stderr)
+    code = 0
+    while True:
+        try:
+            prompt = input("prompt> ").strip()
+        except EOFError:
+            print(file=sys.stderr)
+            break
+        if not prompt:
+            break
+        code = answer(prompt)
+    return code
 
 
 def _verify(args: argparse.Namespace) -> int:
@@ -192,18 +293,30 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--threads", type=int)
     p.add_argument("--device", default=None)
     p.add_argument("--no-verify", dest="no_verify", action="store_true", default=None)
+    p.add_argument("--save-every", dest="save_every", type=int,
+                   help="steps between resumable checkpoints (default 200)")
+    p.add_argument("--resume", action="store_true", default=None,
+                   help="continue exactly from <out>/checkpoint")
+    p.add_argument("--max-steps", dest="max_steps", type=int)
     p.set_defaults(func=_train)
 
     p = sub.add_parser("model-eval", help="score a trained model")
-    p.add_argument("--model", required=True)
+    p.add_argument("--model", default=_default_model())
     p.add_argument("--data", required=True)
     p.add_argument("--limit", type=int, default=None)
     p.add_argument("--device", default="auto")
     p.set_defaults(func=_model_eval)
 
+    p = sub.add_parser("ood-eval", help="score a model on hand-written requests")
+    p.add_argument("--model", default=_default_model())
+    p.add_argument("--device", default="auto")
+    p.add_argument("--show", type=int, default=20, help="failures to print")
+    p.add_argument("--details", help="save the full report as JSON")
+    p.set_defaults(func=_ood_eval)
+
     for name, func in (("solve", _solve), ("verify", _verify)):
         p = sub.add_parser(name)
-        p.add_argument("--model", required=True)
+        p.add_argument("--model", default=_default_model())
         p.add_argument("--input", required=True, help="text file to transform")
         p.add_argument("--prompt", help="instruction (asked interactively if omitted)")
         p.add_argument("--prompt-file", dest="prompt_file")
@@ -216,6 +329,23 @@ def build_parser() -> argparse.ArgumentParser:
         else:
             p.add_argument("--pipeline", required=True, help=".tft file to verify")
         p.set_defaults(func=func)
+
+    p = sub.add_parser("ask", help="use the model: ask TEXT_FILE [\"request\"]",
+                       description="Transform TEXT_FILE (or - for stdin) according to an "
+                       "English request. Without the request, opens an interactive prompt.")
+    p.add_argument("input", help="text file to transform, or - for stdin")
+    p.add_argument("prompt", nargs="?", help="request in English (interactive if omitted)")
+    p.add_argument("-f", "--prompt-file", dest="prompt_file", help="read the request from a file")
+    p.add_argument("-o", "--output", help="save the transformed text to this file")
+    p.add_argument("-p", "--save-pipeline", dest="save_pipeline", help="save the pipeline (.tft)")
+    p.add_argument("-e", "--expected", help="file with the expected output (exact validation)")
+    p.add_argument("-v", "--verbose", action="store_true", help="show every candidate")
+    p.add_argument("--model", default=_default_model(),
+                   help="model directory (default: runs/codet5-v2/best if trained, else "
+                   "runs/codet5-small/best; or $TFAI_MODEL)")
+    p.add_argument("--device", default="auto")
+    p.add_argument("--candidates", type=int, default=4)
+    p.set_defaults(func=_ask)
     return parser
 
 

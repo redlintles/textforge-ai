@@ -38,7 +38,7 @@ pytest                                # 135 testes, ~30 s
 python -m textforge_ai gen-data --n 20000 --out data
 ```
 
-### 3. Treino rápido de validação (~20–30 min)
+### 3. Treino rápido de validação (~15 min, medido)
 
 Antes de deixar horas rodando, confirme que tudo funciona com o modelo de verdade
 (baixa ~250 MB do Hugging Face na primeira vez):
@@ -51,20 +51,35 @@ python -m textforge_ai train --data data --out runs/teste \
 O log mostra `loss` caindo e uma estimativa de tempo (`eta`). No fim de cada época
 aparece uma linha `eval {...}` com as métricas na validação.
 
-### 4. Treino completo (~3–5 h em CPU, estimativa)
+### 4. Treino completo (~9 h com 2 épocas, ~14 h com 3; ver "Medição de tempo")
 
 ```bash
-nohup python -m textforge_ai train --data data --out runs/codet5-small --epochs 3 \
-    > train.log 2>&1 &
-tail -f train.log         # acompanhar; Ctrl+C só fecha o tail
+bash scripts/treinar.sh completo --epochs 2   # roda em segundo plano, log em train.log
+tail -f train.log                              # acompanhar; Ctrl+C só fecha o tail
 ```
 
-- Para interromper com segurança: `kill -INT <pid>`. O modelo é salvo em
-  `runs/codet5-small/interrupted`.
-- Para continuar depois: `--model runs/codet5-small/last` (ou `interrupted`). O otimizador
-  recomeça do zero, então use `--lr 1e-4`.
-- Cada época salva `last/`; a melhor (por `gen_probe_accuracy`) fica em `best/`, com
-  `train_info.json` (configuração + histórico de métricas).
+### Parar e retomar
+
+O treino pode ser interrompido a qualquer momento sem perder o progresso:
+
+```bash
+bash scripts/treinar.sh parar       # termina o passo atual, salva e sai
+bash scripts/treinar.sh continuar   # retoma exatamente de onde parou
+```
+
+- A cada 200 passos (~12 min) o estado completo é salvo em `runs/codet5-small/checkpoint/`:
+  pesos, otimizador, agenda da taxa de aprendizado, estado do gerador aleatório e posição
+  dentro da época. Se o PC desligar ou travar, perde-se no máximo esses ~12 min.
+- `Ctrl+C`, `kill` e desligamento normal do sistema (SIGTERM) também salvam antes de sair.
+  Um segundo `Ctrl+C` força a saída sem salvar.
+- A gravação é atômica: se o PC cair *durante* a gravação, o checkpoint anterior continua
+  intacto.
+- Ao retomar, as configurações do treino (épocas, lr, lote, dados) vêm do checkpoint, então
+  não dá para misturar sem querer.
+- Retomar dá **o mesmo resultado** de nunca ter parado: o teste
+  `test_resume_continues_exactly` compara os pesos finais dos dois casos.
+- Cada época também salva `last/`; a melhor (por `gen_probe_accuracy`) fica em `best/`,
+  com `train_info.json` (configuração + histórico de métricas).
 
 ### 5. Avaliar no conjunto de teste
 
@@ -75,23 +90,29 @@ python -m textforge_ai model-eval --model runs/codet5-small/best --data data/tes
 ### 6. Usar
 
 ```bash
-# pedido digitado no terminal (pergunta "prompt>")
-python -m textforge_ai solve --model runs/codet5-small/best --input texto.txt
-
-# pedido em arquivo, salvando pipeline e resultado
-python -m textforge_ai solve --model runs/codet5-small/best --input texto.txt \
-    --prompt-file pedido.txt --save-pipeline saida.tft --save-output saida.txt
-
-# validação exata, quando você sabe a saída esperada
-python -m textforge_ai solve ... --expected esperado.txt
-
-# validar um pipeline escrito por você
-python -m textforge_ai verify --model runs/codet5-small/best --input texto.txt \
-    --pipeline meu.tft --prompt "uppercase everything"
+./tfai texto.txt "Uppercase the text."     # um pedido; não precisa ativar a .venv
+./tfai texto.txt                           # interativo: carrega o modelo uma vez, vários pedidos
+./tfai texto.txt "Remove all whitespace." -o saida.txt -p saida.tft   # salva texto e pipeline
+./tfai texto.txt "..." -e esperado.txt     # validação exata, quando você sabe a saída
+./tfai texto.txt "..." -v                  # mostra todos os candidatos
+echo "some text" | ./tfai - "Uppercase the text."
 ```
 
-`solve` mostra em stderr todos os candidatos (pipeline, erro do engine, veredito,
-suspeita de trapaça) e em stdout o melhor: pipeline, veredito e saída.
+- `texto.txt` é **o texto a transformar**. O pedido vai separado, como argumento.
+- O pedido precisa ser em **inglês, no estilo do dataset**, com valores literais entre
+  aspas duplas: `Remove all whitespace. Append "banana" to the text. Prepend "orange" to
+  the text.` Pedidos em português ou com frases muito diferentes dos templates fazem o
+  modelo gerar lixo, e o `ask` avisa isso.
+- Modelo padrão: `runs/codet5-small/best` (troque com `--model` ou a variável `TFAI_MODEL`).
+- Para usar de qualquer pasta: `ln -s "$PWD/tfai" ~/.local/bin/tfai`.
+
+Comandos longos equivalentes (`--model` agora é opcional em todos):
+
+```bash
+python -m textforge_ai solve --input texto.txt --prompt-file pedido.txt \
+    --save-pipeline saida.tft --save-output saida.txt
+python -m textforge_ai verify --input texto.txt --pipeline meu.tft --prompt "Uppercase the text."
+```
 
 ## Hiperparâmetros (padrões)
 
@@ -121,10 +142,70 @@ não generaliza, o que é esperado para ~0,1M parâmetros. Generalizar é o pape
 
 ## Medição de tempo
 
-Arquitetura idêntica à do `codet5-small` (60,5M parâmetros), lote 16, em 2 núcleos de CPU:
-**2,8 s por passo**. Extrapolando para 6 núcleos/12 threads (Ryzen 5 4600G): ~1 s por
-passo → ~4,3k passos por época → **~1–1,5 h por época**. É estimativa, não medição: o
-primeiro treino curto (passo 3) dá o número real pelo `eta`.
+Medido no PC do usuário (Ryzen 5 4600G, 12 threads, CPU) em 2026-11-23, treino de teste:
+**250 passos em 15,3 min = 3,7 s por passo** (lote 16).
+
+A estimativa anterior (~1 s/passo, extrapolada de 2 núcleos de outra máquina) estava
+errada por um fator de ~3,7. Lição: medir antes de prometer tempo.
+
+Treino completo: ~72k pares (1 de geração + até 3 de verificação por exemplo) →
+~4,5k passos por época → **~4,6 h por época**:
+
+| épocas | tempo aproximado |
+|---|---|
+| 1 | ~4,6 h |
+| 2 | ~9 h |
+| 3 | ~14 h |
+
+## Primeiro resultado real (treino de teste, 2026-11-23)
+
+1000 exemplos, 1 época, avaliado em 100 exemplos de validação:
+
+| métrica | valor |
+|---|---|
+| `gen_probe_accuracy` | 0,56 |
+| `gen_exact_match` | 0,54 |
+| `gen_valid_rate` | 0,92 |
+| `verify_accuracy` | 0,56 |
+
+A geração já aprende bem com poucos dados. O verificador ainda está perto do acaso
+(~0,5): é a tarefa mais difícil e teve só ~3k pares. Se continuar perto de 0,5 depois do
+treino completo, o formato da tarefa de verificação precisa ser revisto.
+
+## Resultado do treino completo (2026-11-24)
+
+Dataset completo, 2 épocas, 9036 passos, ~466 min. Avaliado em 300 exemplos de validação
+(900 pares de verificação) ao fim de cada época:
+
+| métrica | teste (1k ex.) | época 1 | época 2 |
+|---|---|---|---|
+| `gen_probe_accuracy` | 0,56 | 1,00 | **1,00** |
+| `gen_exact_match` | 0,54 | 0,983 | 0,987 |
+| `gen_valid_rate` | 0,92 | 1,00 | 1,00 |
+| `verify_accuracy` | 0,56 | 0,887 | **0,929** |
+
+Leitura:
+
+- **Gerador**: acerta todos os probes em todos os exemplos avaliados. A diferença entre
+  `exact_match` e `probe_accuracy` são pipelines escritos de outro jeito mas equivalentes
+  na execução, o que é desejável. Já estava em 100% na época 1.
+- **Verificador**: saiu do acaso (0,56) para 0,93, e a época 2 ainda ajudou (0,89 → 0,93).
+  O formato da tarefa funciona. Ainda erra ~1 em 14: o veredito é estimativa.
+- **Ressalva principal**: validação e treino vêm do mesmo gerador sintético (mesmos
+  templates de frase). 100% aqui mede "aprendeu os templates", não "entende inglês livre".
+
+Primeiro uso real (`solve`) falhou por dois motivos, nenhum deles bug do modelo:
+1. `cat "frase" >> input.txt` não escreve a frase (o `cat` trata como nome de arquivo), mas
+   o `>>` cria o arquivo vazio. O texto de entrada estava vazio.
+2. O pedido foi escrito em português. Nenhum dos 4 candidatos era um pipeline válido, e o
+   `solve` só dizia "no candidate passed validation". Agora `ask`/`solve` explicam o motivo.
+
+Próximos passos de avaliação:
+
+1. `model-eval` no `data/test.jsonl` completo (~1000 exemplos).
+2. Teste manual com pedidos em inglês fora das frases dos templates (paráfrases, ordem
+   diferente, sinônimos). É aí que se mede generalização (fase 6).
+3. Se a fase 6 incluir pedidos em português, o dataset precisa de templates em português.
 
 ## Lacunas conhecidas
 
@@ -132,3 +213,4 @@ primeiro treino curto (passo 3) dá o número real pelo `eta`.
 - Não há laço de autocorreção ainda (fase 4): `solve` só escolhe entre os candidatos.
 - Sem decodificação restrita (fase 5): o modelo pode gerar mnemônicos inexistentes;
   esses candidatos são descartados pelo parser.
+- Generalização para pedidos fora dos templates ainda não medida.
